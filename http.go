@@ -62,6 +62,10 @@ type Request struct {
 	// if <= 0, means not set
 	timeout time.Duration
 
+	// retryPolicy optionally overrides the client-wide RetryPolicy for
+	// this single request. Set via SetRetryPolicy. Cleared by Reset.
+	retryPolicy RetryPolicy
+
 	secureErrorLogMessage bool
 
 	// Group bool members in order to reduce Request object size.
@@ -1293,6 +1297,7 @@ func (req *Request) Reset() {
 	req.Header.Reset()
 	req.resetSkipHeader()
 	req.timeout = 0
+	req.retryPolicy = nil
 	req.forceResponseBodyBuffering = false
 	req.UseHostHeader = false
 	req.DisableRedirectPathNormalizing = false
@@ -3051,4 +3056,21 @@ func readCrLf(r *bufio.Reader) error {
 //	c.DoTimeout(&req, &resp, t)
 func (req *Request) SetTimeout(t time.Duration) {
 	req.timeout = t
+}
+
+// SetRetryPolicy sets a per-request RetryPolicy, overriding the
+// Client/HostClient-wide default for this request only.
+//
+// Pass nil to remove the override and fall back to the client-wide
+// policy (which may itself be nil, i.e. immediate retries).
+//
+// The policy is cleared by Request.Reset and is not copied by CopyTo.
+func (req *Request) SetRetryPolicy(p RetryPolicy) {
+	req.retryPolicy = p
+}
+
+// RetryPolicy returns the per-request RetryPolicy set with SetRetryPolicy,
+// or nil if none was set.
+func (req *Request) RetryPolicy() RetryPolicy {
+	return req.retryPolicy
 }

@@ -244,6 +244,24 @@ type Client struct {
 	// Upstream information is a <host>:<port> format.
 	RetryIfErrUpstream RetryIfErrUpstreamFunc
 
+	// RetryPolicy computes the delay to wait before scheduling another
+	// retry attempt, based on the request, the attempt number, the error
+	// and the response status. It also enables retrying retryable
+	// response status codes such as 429 and 503 (optionally honoring the
+	// Retry-After header).
+	//
+	// When nil, the client retries immediately as before and keeps the
+	// non-idempotent request protection.
+	//
+	// A per-request policy set via Request.SetRetryPolicy takes
+	// precedence over this client-wide default.
+	RetryPolicy RetryPolicy
+
+	// RetryNotify, if non-nil, is called before every retry wait with the
+	// attempt number, the computed delay and the last error. It may be
+	// used for logging and metrics.
+	RetryNotify RetryNotifyFunc
+
 	// ConfigureClient configures the fasthttp.HostClient.
 	ConfigureClient func(hc *HostClient) error
 
@@ -614,6 +632,8 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 		RetryIf:                       c.RetryIf,
 		RetryIfErr:                    c.RetryIfErr,
 		RetryIfErrUpstream:            c.RetryIfErrUpstream,
+		RetryPolicy:                   c.RetryPolicy,
+		RetryNotify:                   c.RetryNotify,
 		ConnPoolStrategy:              c.ConnPoolStrategy,
 		StreamResponseBody:            c.StreamResponseBody,
 		clientReaderPool:              &c.readerPool,
@@ -842,6 +862,24 @@ type HostClient struct {
 	// RetryIfErrUpstream works just like RetryIfErr but also provides information about which upstream causes the error, if known.
 	// Upstream information is a <host>:<port> format.
 	RetryIfErrUpstream RetryIfErrUpstreamFunc
+
+	// RetryPolicy computes the delay to wait before scheduling another
+	// retry attempt, based on the request, the attempt number, the error
+	// and the response status. It also enables retrying retryable
+	// response status codes such as 429 and 503 (optionally honoring the
+	// Retry-After header).
+	//
+	// When nil, the client retries immediately as before and keeps the
+	// non-idempotent request protection.
+	//
+	// A per-request policy set via Request.SetRetryPolicy takes
+	// precedence over this client-wide default.
+	RetryPolicy RetryPolicy
+
+	// RetryNotify, if non-nil, is called before every retry wait with the
+	// attempt number, the computed delay and the last error. It may be
+	// used for logging and metrics.
+	RetryNotify RetryNotifyFunc
 
 	connsWait *wantConnQueue
 
@@ -1636,6 +1674,14 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		retryFunc = isIdempotent
 	}
 
+	// A per-request policy overrides the client-wide default. When neither
+	// is set, retries remain immediate and the historical behavior,
+	// including non-idempotent request protection, is preserved.
+	policy := req.retryPolicy
+	if policy == nil {
+		policy = c.RetryPolicy
+	}
+
 	atomic.AddInt32(&c.pendingRequests, 1)
 	for {
 		// If the original timeout was set, we need to update
@@ -1649,7 +1695,22 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		}
 
 		retry, err = c.do(req, resp)
-		if err == nil || !retry {
+
+		// A configured policy may also retry retryable response statuses
+		// such as 429 and 503, optionally honoring Retry-After. Such
+		// retries are gated by the same idempotent request protection
+		// used for error retries, and never replay a body stream.
+		statusRetry := false
+		if err == nil {
+			if policy != nil && !hasBodyStream && resp != nil &&
+				isRetryableStatus(resp.StatusCode()) && retryFunc(req) {
+				retry = true
+				statusRetry = true
+			} else {
+				break
+			}
+		}
+		if !retry {
 			break
 		}
 
@@ -1660,25 +1721,64 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		attempts++
 
 		if attempts >= maxAttempts {
-			break
-		}
-		switch {
-		case c.RetryIfErrUpstream != nil:
-			upstream := ""
-			if resp != nil && resp.RemoteAddr() != nil {
-				upstream = resp.RemoteAddr().String()
+			// A status-driven retry that runs out of attempts leaves the
+			// valid response with the caller instead of an error.
+			if statusRetry {
+				err = nil
 			}
-			resetTimeout, retry = c.RetryIfErrUpstream(req, attempts, err, upstream)
-		case c.RetryIfErr != nil:
-			resetTimeout, retry = c.RetryIfErr(req, attempts, err)
-		default:
-			retry = retryFunc(req)
-		}
-		if !retry {
 			break
 		}
-		if timeout > 0 && resetTimeout {
-			deadline = time.Now().Add(timeout)
+
+		resetTimeout = false
+		if statusRetry {
+			// Response-driven retries don't go through the error callbacks.
+			retry = true
+		} else {
+			switch {
+			case c.RetryIfErrUpstream != nil:
+				upstream := ""
+				if resp != nil && resp.RemoteAddr() != nil {
+					upstream = resp.RemoteAddr().String()
+				}
+				resetTimeout, retry = c.RetryIfErrUpstream(req, attempts, err, upstream)
+			case c.RetryIfErr != nil:
+				resetTimeout, retry = c.RetryIfErr(req, attempts, err)
+			default:
+				retry = retryFunc(req)
+			}
+			if !retry {
+				break
+			}
+			if timeout > 0 && resetTimeout {
+				deadline = time.Now().Add(timeout)
+			}
+		}
+
+		// Compute the backoff delay (zero without a policy) and observe
+		// the scheduled retry before waiting.
+		delay := time.Duration(0)
+		if policy != nil {
+			delay = policy.RetryDelay(req, resp, attempts, err)
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		if c.RetryNotify != nil {
+			c.RetryNotify(req, resp, attempts, delay, err)
+		}
+		if delay > 0 {
+			// The wait must obey the request timeout/deadline: if the
+			// delay does not fit in the remaining time, fail with
+			// ErrTimeout instead of waiting past it.
+			if timeout > 0 {
+				if remaining := time.Until(deadline); delay >= remaining {
+					err = ErrTimeout
+					break
+				}
+			}
+			timer := AcquireTimer(delay)
+			<-timer.C
+			ReleaseTimer(timer)
 		}
 	}
 	atomic.AddInt32(&c.pendingRequests, -1)
