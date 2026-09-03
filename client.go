@@ -208,6 +208,21 @@ type Client struct {
 	// Transport defines a transport-like mechanism that wraps every request/response.
 	Transport RoundTripper
 
+	// Jar manages cookies for requests performed by the client. Cookies from
+	// Set-Cookie response headers are stored in the jar automatically, and
+	// matching cookies are attached to subsequent requests, including on
+	// every redirect hop (cross-domain redirects re-select cookies from
+	// the jar for the new host instead of forwarding the old Cookie header).
+	//
+	// Cookies set manually on a request take precedence over jar cookies
+	// with the same name. Set Jar to nil to disable cookie management;
+	// request and response cookie headers are left untouched in that case.
+	//
+	// Use NewCookieJar for the built-in thread-safe implementation. The jar
+	// is shared by all requests and goroutines using the client, so it must
+	// be safe for concurrent use and must not be changed while in use.
+	Jar CookieJar
+
 	// Callback for establishing new connections to hosts.
 	//
 	// Default DialTimeout is used if not set.
@@ -592,6 +607,7 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 	hc = &HostClient{
 		Addr:                          AddMissingPort(string(host), isTLS),
 		Transport:                     c.Transport,
+		Jar:                           c.Jar,
 		Name:                          c.Name,
 		NoDefaultUserAgentHeader:      c.NoDefaultUserAgentHeader,
 		Dial:                          c.Dial,
@@ -809,6 +825,20 @@ type HostClient struct {
 
 	// Transport defines a transport-like mechanism that wraps every request/response.
 	Transport RoundTripper
+
+	// Jar manages cookies for requests performed by the client. Cookies from
+	// Set-Cookie response headers are stored in the jar automatically, and
+	// matching cookies are attached to subsequent requests, including on
+	// every redirect hop. A Client assigned a Jar propagates it to the
+	// HostClients it creates.
+	//
+	// Cookies set manually on a request take precedence over jar cookies
+	// with the same name. Set Jar to nil to disable cookie management;
+	// request and response cookie headers are left untouched in that case.
+	//
+	// Use NewCookieJar for the built-in thread-safe implementation. The jar
+	// must be safe for concurrent use and must not be changed while in use.
+	Jar CookieJar
 
 	// Callback for establishing new connections to hosts.
 	//
@@ -1768,7 +1798,13 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 		}
 	}
 
-	return c.transport().RoundTrip(c, req, resp)
+	c.addJarCookies(req)
+
+	retry, err := c.transport().RoundTrip(c, req, resp)
+	if err == nil {
+		c.saveJarCookies(req, resp)
+	}
+	return retry, err
 }
 
 func (c *HostClient) transport() RoundTripper {
@@ -1776,6 +1812,98 @@ func (c *HostClient) transport() RoundTripper {
 		return DefaultTransport
 	}
 	return c.Transport
+}
+
+// addJarCookies attaches the cookies stored in c.Jar that match the request
+// URL before the request is sent.
+//
+// Cookies already present on the request (set manually via SetCookie or a
+// raw Cookie header) are left untouched and take precedence over jar
+// cookies with the same name. Redirect hops that strip the Cookie header
+// for an untrusted target get a fresh set of cookies from the jar for the
+// new URL on their next addJarCookies call.
+func (c *HostClient) addJarCookies(req *Request) {
+	jar := c.Jar
+	if jar == nil {
+		return
+	}
+
+	u, release := jarURIForRequest(c, req)
+	if release {
+		defer ReleaseURI(u)
+	}
+
+	for _, cookie := range jar.Cookies(u) {
+		if req.Header.CookieBytes(cookie.Key()) == nil {
+			req.Header.SetCookieBytesKV(cookie.Key(), cookie.Value())
+		}
+	}
+}
+
+// saveJarCookies stores every Set-Cookie header of the response in c.Jar,
+// keyed by the request URL. It runs after each successful RoundTrip, so
+// cookies set by redirect responses are absorbed before the redirect is
+// followed as well.
+func (c *HostClient) saveJarCookies(req *Request, resp *Response) {
+	jar := c.Jar
+	if jar == nil {
+		return
+	}
+
+	u, release := jarURIForRequest(c, req)
+	if release {
+		defer ReleaseURI(u)
+	}
+
+	var cookies []*Cookie
+	resp.Header.Cookies()(func(_, setCookieValue []byte) bool {
+		cookie := AcquireCookie()
+		if err := cookie.ParseBytes(setCookieValue); err == nil {
+			cookies = append(cookies, cookie)
+		} else {
+			ReleaseCookie(cookie)
+		}
+		return true
+	})
+	if len(cookies) == 0 {
+		return
+	}
+
+	jar.SetCookies(u, cookies)
+	for _, cookie := range cookies {
+		ReleaseCookie(cookie)
+	}
+}
+
+// jarURIForRequest returns the URL to use for jar lookups. Requests sent
+// through a HostClient may carry only a request-target without an authority
+// (HostClient.Addr supplies the host then); the second return value reports
+// whether the returned URI is pooled and must be released with ReleaseURI.
+func jarURIForRequest(c *HostClient, req *Request) (*URI, bool) {
+	u := req.URI()
+	if len(u.Host()) > 0 {
+		return u, false
+	}
+
+	addr := c.Addr
+	if i := strings.IndexByte(addr, ','); i >= 0 {
+		addr = addr[:i]
+	}
+	addr = strings.TrimSpace(addr)
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+
+	jarURI := AcquireURI()
+	u.CopyTo(jarURI)
+	jarURI.SetHost(host)
+	if c.IsTLS {
+		jarURI.SetSchemeBytes(strHTTPS)
+	} else {
+		jarURI.SetSchemeBytes(strHTTP)
+	}
+	return jarURI, true
 }
 
 var (
